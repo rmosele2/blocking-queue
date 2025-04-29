@@ -45,8 +45,8 @@ void set_finished() {
   
     lock_guard<mutex> lock(m);
     finished = true;
+    cv.notify_all();
   }
-  cv.notify_all();
 };
 
 struct ParseException : std::runtime_error, rapidjson::ParseResult {
