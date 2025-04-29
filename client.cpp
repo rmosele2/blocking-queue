@@ -42,9 +42,10 @@ bool pop(T& item) {
 }
 
 void set_finished() {
-  
+  {
     lock_guard<mutex> lock(m);
     finished = true;
+  }
     cv.notify_all();
   }
 };
