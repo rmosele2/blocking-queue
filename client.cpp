@@ -1,7 +1,14 @@
 #include <iostream>
 #include <string>
+#include <vector>
 #include <queue>
 #include <unordered_set>
+#include <unordered_map>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <curl/curl.h>
@@ -9,6 +16,38 @@
 #include "rapidjson/error/error.h"
 #include "rapidjson/reader.h"
 
+template <typename T>
+class BlockingQueue {
+  queue<T> q;
+  mutex m;
+  condition_variable cv;
+  bool finished = false;
+
+public:
+  void push(const T& item) {
+    {
+      lock_guard<mutex> lock(m);
+      q.push(item);
+    }
+  cv.notify_one();
+}
+
+bool pop(T& item) {
+  unique_lock<mutex> lock(m);
+  cv.wait(lock, [&] { return !q.empty() || finished; });
+  if (q.empty()) return false;
+  item = q.front();
+  q.pop();
+  return true;
+}
+
+void set_finished() {
+  
+    lock_guard<mutex> lock(m);
+    finished = true;
+  }
+  cv.notify_all();
+};
 
 struct ParseException : std::runtime_error, rapidjson::ParseResult {
     ParseException(rapidjson::ParseErrorCode code, const char* msg, size_t offset) : 
@@ -102,37 +141,69 @@ vector<string> get_neighbors(const string& json_str) {
 }
 
 // BFS Traversal Function
-vector<string> bfs(CURL* curl, const string& start, int depth) {
-    queue<pair<string, int>> q;
-    unordered_set<string> visited;
-    vector<string> result;
+vector<string> bfs_parallel(const string& start, int depth) {
+  BlockingQueue<pair<string, int>> q;
+  mutex visited_mutex;
+  atomic<int> active_threads(0);
+  unordered_set<string> visited;
+  vector<string> result;
+  mutex result_mutex;
 
-    q.push({start, 0});
-    visited.insert(start);
+  q.push({start, 0});
+  visited.insert(start);
 
-    while (!q.empty()) {
-        auto [node, level] = q.front();
-        q.pop();
+  auto worker = [&](CURL* curl) {
+      pair<string, int> task;
+      while (q.pop(task)) {
+          active_threads++;
+          auto [node, level] = task;
 
-        if (level <= depth) {
-            result.push_back(node);
-        }
-        
-        if (level < depth) {
-	    try {
-	      for (const auto& neighbor : get_neighbors(fetch_neighbors(curl, node))) {
-                if (!visited.count(neighbor)) {
-		  visited.insert(neighbor);
-		  q.push({neighbor, level + 1});
-                }
-	      }
-	    } catch (const ParseException& e) {
-	      std::cerr<<"Error while fetching neighbors of: "<<node<<std::endl;
-	      throw e;
-	    }
-        }
-    }
-    return result;
+          {
+              lock_guard<mutex> lock(result_mutex);
+              result.push_back(node);
+          }
+
+          if (level < depth) {
+              string response = fetch_neighbors(curl, node);
+              for (const auto& neighbor : get_neighbors(response)) {
+                  lock_guard<mutex> lock(visited_mutex);
+                  if (visited.insert(neighbor).second) {
+                      q.push({neighbor, level + 1});
+                  }
+              }
+          }
+
+          active_threads--;
+      }
+  };
+
+  int num_threads = 8;
+  vector<thread> threads;
+  vector<CURL*> curls(num_threads);
+
+  for (int i = 0; i < num_threads; ++i) {
+      curls[i] = curl_easy_init();
+      threads.emplace_back(worker, curls[i]);
+  }
+
+  // Wait for queue to become idle
+  while (true) {
+      this_thread::sleep_for(chrono::milliseconds(100));
+      if (active_threads == 0) {
+          pair<string, int> dummy;
+          if (!q.pop(dummy)) {
+              q.set_finished();
+              break;
+          } else {
+              q.push(dummy);
+          }
+      }
+  }
+
+  for (auto& t : threads) t.join();
+  for (auto* c : curls) curl_easy_cleanup(c);
+
+  return result;
 }
 
 int main(int argc, char* argv[]) {
@@ -150,25 +221,16 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        cerr << "Failed to initialize CURL" << endl;
-        return -1;
-    }
+    const auto start = std::chrono::steady_clock::now();
 
+vector<string> result = bfs_parallel(start_node, depth);
 
-    const auto start{std::chrono::steady_clock::now()};
-    
-    
-    for (const auto& node : bfs(curl, start_node, depth))
-        cout << "- " << node << "\n";
+for (const auto& node : result)
+    cout << "- " << node << "\n";
 
-    const auto finish{std::chrono::steady_clock::now()};
-    const std::chrono::duration<double> elapsed_seconds{finish - start};
-    std::cout << "Time to crawl: "<<elapsed_seconds.count() << "s\n";
-    
-    curl_easy_cleanup(curl);
-
+const auto finish = std::chrono::steady_clock::now();
+std::chrono::duration<double> elapsed_seconds = finish - start;
+std::cout << "Time to crawl: " << elapsed_seconds.count() << "s\n";
     
     return 0;
 }
