@@ -13,207 +13,176 @@
 #include <cstdlib>
 #include <curl/curl.h>
 #include <stdexcept>
-#include "rapidjson/error/error.h"
-#include "rapidjson/reader.h"
-
-template <typename T>
-class BlockingQueue {
-  queue<T> q;
-  mutex m;
-  condition_variable cv;
-  bool finished = false;
-
-public:
-  void push(const T& item) {
-    {
-      lock_guard<mutex> lock(m);
-      q.push(item);
-    }
-  cv.notify_one();
-}
-
-bool pop(T& item) {
-  unique_lock<mutex> lock(m);
-  cv.wait(lock, [&] { return !q.empty() || finished; });
-  if (q.empty()) return false;
-  item = q.front();
-  q.pop();
-  return true;
-}
-
-void set_finished() {
-  {
-    lock_guard<mutex> lock(m);
-    finished = true;
-  }
-    cv.notify_all();
-  }
-};
-
-struct ParseException : std::runtime_error, rapidjson::ParseResult {
-    ParseException(rapidjson::ParseErrorCode code, const char* msg, size_t offset) : 
-        std::runtime_error(msg), 
-        rapidjson::ParseResult(code, offset) {}
-};
-
-#define RAPIDJSON_PARSE_ERROR_NORETURN(code, offset) \
-    throw ParseException(code, #code, offset)
-
 #include <rapidjson/document.h>
-#include <chrono>
+#include <rapidjson/reader.h>
+#include <rapidjson/error/error.h>
 
 using namespace std;
 using namespace rapidjson;
 
-bool debug = false;
+// BlockingQueue definition
 
-// Updated service URL
+template <typename T>
+class BlockingQueue {
+    std::queue<T> q;
+    std::mutex m;
+    std::condition_variable cv;
+    bool finished = false;
+
+public:
+    void push(const T& item) {
+        {
+            std::lock_guard<std::mutex> lock(m);
+            q.push(item);
+        }
+        cv.notify_one();
+    }
+
+    bool pop(T& item) {
+        std::unique_lock<std::mutex> lock(m);
+        cv.wait(lock, [&] { return !q.empty() || finished; });
+        if (q.empty()) return false;
+        item = q.front();
+        q.pop();
+        return true;
+    }
+
+    void set_finished() {
+        {
+            std::lock_guard<std::mutex> lock(m);
+            finished = true;
+        }
+        cv.notify_all();
+    }
+};
+
+bool debug = false;
 const string SERVICE_URL = "http://hollywood-graph-crawler.bridgesuncc.org/neighbors/";
 
-// Function to HTTP ecnode parts of URLs. for instance, replace spaces with '%20' for URLs
 string url_encode(CURL* curl, string input) {
-  char* out = curl_easy_escape(curl, input.c_str(), input.size());
-  string s = out;
-  curl_free(out);
-  return s;
+    char* out = curl_easy_escape(curl, input.c_str(), input.size());
+    string s = out;
+    curl_free(out);
+    return s;
 }
 
-// Callback function for writing response data
 size_t WriteCallback(void* contents, size_t size, size_t nmemb, string* output) {
     size_t totalSize = size * nmemb;
     output->append((char*)contents, totalSize);
     return totalSize;
 }
 
-// Function to fetch neighbors using libcurl with debugging
 string fetch_neighbors(CURL* curl, const string& node) {
-
     string url = SERVICE_URL + url_encode(curl, node);
     string response;
 
     if (debug)
-      cout << "Sending request to: " << url << endl;
+        cout << "Sending request to: " << url << endl;
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    // curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L); // Verbose Logging
-
-    // Set a User-Agent header to avoid potential blocking by the server
     struct curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, "User-Agent: C++-Client/1.0");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
     CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(headers);
 
     if (res != CURLE_OK) {
         cerr << "CURL error: " << curl_easy_strerror(res) << endl;
-    } else {
-      if (debug)
+    } else if (debug) {
         cout << "CURL request successful!" << endl;
     }
 
-    // Cleanup
-    curl_slist_free_all(headers);
-
-    if (debug) 
-      cout << "Response received: " << response << endl;  // Debug log
+    if (debug)
+        cout << "Response received: " << response << endl;
 
     return (res == CURLE_OK) ? response : "{}";
 }
 
-// Function to parse JSON and extract neighbors
 vector<string> get_neighbors(const string& json_str) {
     vector<string> neighbors;
-    try {
-      Document doc;
-      doc.Parse(json_str.c_str());
-      
-      if (doc.HasMember("neighbors") && doc["neighbors"].IsArray()) {
+    Document doc;
+    doc.Parse(json_str.c_str());
+    if (doc.HasMember("neighbors") && doc["neighbors"].IsArray()) {
         for (const auto& neighbor : doc["neighbors"].GetArray())
-	  neighbors.push_back(neighbor.GetString());
-      }
-    } catch (const ParseException& e) {
-      std::cerr<<"Error while parsing JSON: "<<json_str<<std::endl;
-      throw e;
+            neighbors.push_back(neighbor.GetString());
     }
     return neighbors;
 }
 
-// BFS Traversal Function
-vector<string> bfs_parallel(const string& start, int depth) {
-  BlockingQueue<pair<string, int>> q;
-  mutex visited_mutex;
-  atomic<int> active_threads(0);
-  unordered_set<string> visited;
-  vector<string> result;
-  mutex result_mutex;
+vector<string> bfs_parallel(const string& start, int depth, int num_threads = 8) {
+    BlockingQueue<pair<string, int>> q;
+    mutex visited_mutex;
+    atomic<int> active_threads(0);
+    unordered_set<string> visited;
+    vector<string> result;
+    mutex result_mutex;
 
-  q.push({start, 0});
-  visited.insert(start);
+    q.push({start, 0});
+    visited.insert(start);
 
-  auto worker = [&](CURL* curl) {
-      pair<string, int> task;
-      while (q.pop(task)) {
-          active_threads++;
-          auto [node, level] = task;
+    auto worker = [&](CURL* curl) {
+        pair<string, int> task;
+        while (q.pop(task)) {
+            active_threads++;
+            auto [node, level] = task;
 
-          {
-              lock_guard<mutex> lock(result_mutex);
-              result.push_back(node);
-          }
+            {
+                lock_guard<mutex> lock(result_mutex);
+                result.push_back(node);
+            }
 
-          if (level < depth) {
-              string response = fetch_neighbors(curl, node);
-              for (const auto& neighbor : get_neighbors(response)) {
-                  lock_guard<mutex> lock(visited_mutex);
-                  if (visited.insert(neighbor).second) {
-                      q.push({neighbor, level + 1});
-                  }
-              }
-          }
+            if (level < depth) {
+                string response = fetch_neighbors(curl, node);
+                for (const auto& neighbor : get_neighbors(response)) {
+                    lock_guard<mutex> lock(visited_mutex);
+                    if (visited.insert(neighbor).second) {
+                        q.push({neighbor, level + 1});
+                    }
+                }
+            }
 
-          active_threads--;
-      }
-  };
+            active_threads--;
+        }
+    };
 
-  int num_threads = 8;
-  vector<thread> threads;
-  vector<CURL*> curls(num_threads);
+    vector<thread> threads;
+    vector<CURL*> curls(num_threads);
 
-  for (int i = 0; i < num_threads; ++i) {
-      curls[i] = curl_easy_init();
-      threads.emplace_back(worker, curls[i]);
-  }
+    for (int i = 0; i < num_threads; ++i) {
+        curls[i] = curl_easy_init();
+        threads.emplace_back(worker, curls[i]);
+    }
 
-  // Wait for queue to become idle
-  while (true) {
-      this_thread::sleep_for(chrono::milliseconds(100));
-      if (active_threads == 0) {
-          pair<string, int> dummy;
-          if (!q.pop(dummy)) {
-              q.set_finished();
-              break;
-          } else {
-              q.push(dummy);
-          }
-      }
-  }
+    while (true) {
+        this_thread::sleep_for(chrono::milliseconds(100));
+        if (active_threads == 0) {
+            pair<string, int> dummy;
+            if (!q.pop(dummy)) {
+                q.set_finished();
+                break;
+            } else {
+                q.push(dummy);
+            }
+        }
+    }
 
-  for (auto& t : threads) t.join();
-  for (auto* c : curls) curl_easy_cleanup(c);
+    for (auto& t : threads) t.join();
+    for (auto* c : curls) curl_easy_cleanup(c);
 
-  return result;
+    return result;
 }
 
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        cerr << "Usage: " << argv[0] << " <node_name> <depth>\n";
+    if (argc < 3 || argc > 4) {
+        cerr << "Usage: " << argv[0] << " <node_name> <depth> [num_threads]\n";
         return 1;
     }
 
-    string start_node = argv[1];     // example "Tom%20Hanks"
+    string start_node = argv[1];
     int depth;
     try {
         depth = stoi(argv[2]);
@@ -222,16 +191,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const auto start = std::chrono::steady_clock::now();
+    int num_threads = (argc == 4) ? stoi(argv[3]) : 8;
 
-vector<string> result = bfs_parallel(start_node, depth);
+    const auto start = chrono::steady_clock::now();
+    vector<string> result = bfs_parallel(start_node, depth, num_threads);
 
-for (const auto& node : result)
-    cout << "- " << node << "\n";
+    for (const auto& node : result)
+        cout << "- " << node << "\n";
 
-const auto finish = std::chrono::steady_clock::now();
-std::chrono::duration<double> elapsed_seconds = finish - start;
-std::cout << "Time to crawl: " << elapsed_seconds.count() << "s\n";
-    
+    const auto finish = chrono::steady_clock::now();
+    chrono::duration<double> elapsed_seconds = finish - start;
+    cout << "Time to crawl: " << elapsed_seconds.count() << "s\n";
+
     return 0;
 }
