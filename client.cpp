@@ -3,14 +3,11 @@
 #include <vector>
 #include <queue>
 #include <unordered_set>
-#include <unordered_map>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
 #include <atomic>
-#include <cstdio>
-#include <cstdlib>
 #include <curl/curl.h>
 #include <stdexcept>
 #include <rapidjson/document.h>
@@ -20,26 +17,24 @@
 using namespace std;
 using namespace rapidjson;
 
-// BlockingQueue definition
-
 template <typename T>
 class BlockingQueue {
-    std::queue<T> q;
-    std::mutex m;
-    std::condition_variable cv;
+    queue<T> q;
+    mutex m;
+    condition_variable cv;
     bool finished = false;
 
 public:
     void push(const T& item) {
         {
-            std::lock_guard<std::mutex> lock(m);
+            lock_guard<mutex> lock(m);
             q.push(item);
         }
         cv.notify_one();
     }
 
     bool pop(T& item) {
-        std::unique_lock<std::mutex> lock(m);
+        unique_lock<mutex> lock(m);
         cv.wait(lock, [&] { return !q.empty() || finished; });
         if (q.empty()) return false;
         item = q.front();
@@ -49,17 +44,22 @@ public:
 
     void set_finished() {
         {
-            std::lock_guard<std::mutex> lock(m);
+            lock_guard<mutex> lock(m);
             finished = true;
         }
         cv.notify_all();
+    }
+
+    bool empty() {
+        lock_guard<mutex> lock(m);
+        return q.empty();
     }
 };
 
 bool debug = false;
 const string SERVICE_URL = "http://hollywood-graph-crawler.bridgesuncc.org/neighbors/";
 
-string url_encode(CURL* curl, string input) {
+string url_encode(CURL* curl, const string& input) {
     char* out = curl_easy_escape(curl, input.c_str(), input.size());
     string s = out;
     curl_free(out);
@@ -83,6 +83,8 @@ string fetch_neighbors(CURL* curl, const string& node) {
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L); // prevent hangs
+
     struct curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, "User-Agent: C++-Client/1.0");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -115,11 +117,10 @@ vector<string> get_neighbors(const string& json_str) {
 
 vector<string> bfs_parallel(const string& start, int depth, int num_threads = 8) {
     BlockingQueue<pair<string, int>> q;
-    mutex visited_mutex;
-    atomic<int> active_threads(0);
+    mutex visited_mutex, result_mutex;
     unordered_set<string> visited;
     vector<string> result;
-    mutex result_mutex;
+    atomic<int> active_threads(0);
 
     q.push({start, 0});
     visited.insert(start);
@@ -128,7 +129,7 @@ vector<string> bfs_parallel(const string& start, int depth, int num_threads = 8)
         pair<string, int> task;
         while (q.pop(task)) {
             active_threads++;
-            auto [node, level] = task;
+            const auto& [node, level] = task;
 
             {
                 lock_guard<mutex> lock(result_mutex);
@@ -151,22 +152,17 @@ vector<string> bfs_parallel(const string& start, int depth, int num_threads = 8)
 
     vector<thread> threads;
     vector<CURL*> curls(num_threads);
-
     for (int i = 0; i < num_threads; ++i) {
         curls[i] = curl_easy_init();
         threads.emplace_back(worker, curls[i]);
     }
 
+    // Termination monitor loop
     while (true) {
         this_thread::sleep_for(chrono::milliseconds(100));
-        if (active_threads == 0) {
-            pair<string, int> dummy;
-            if (!q.pop(dummy)) {
-                q.set_finished();
-                break;
-            } else {
-                q.push(dummy);
-            }
+        if (active_threads == 0 && q.empty()) {
+            q.set_finished();
+            break;
         }
     }
 
@@ -183,25 +179,27 @@ int main(int argc, char* argv[]) {
     }
 
     string start_node = argv[1];
-    int depth;
+    int depth, num_threads = 8;
+
     try {
         depth = stoi(argv[2]);
-    } catch (const exception& e) {
-        cerr << "Error: Depth must be an integer.\n";
+        if (argc == 4) num_threads = stoi(argv[3]);
+    } catch (...) {
+        cerr << "Error: Invalid numeric argument.\n";
         return 1;
     }
 
-    int num_threads = (argc == 4) ? stoi(argv[3]) : 8;
-
     const auto start = chrono::steady_clock::now();
     vector<string> result = bfs_parallel(start_node, depth, num_threads);
+    const auto finish = chrono::steady_clock::now();
+    chrono::duration<double> elapsed_seconds = finish - start;
 
     for (const auto& node : result)
         cout << "- " << node << "\n";
 
-    const auto finish = chrono::steady_clock::now();
-    chrono::duration<double> elapsed_seconds = finish - start;
-    cout << "Time to crawl: " << elapsed_seconds.count() << "s\n";
+    cerr << "Threads: " << num_threads
+         << ", Nodes visited: " << result.size()
+         << ", Time: " << elapsed_seconds.count() << "s\n";
 
     return 0;
 }
